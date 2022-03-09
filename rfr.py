@@ -2,150 +2,235 @@ import os
 
 import bencode
 
-CHUNK_HASH_SIZE = 20
-num_chunks = 0
-chunk_size = 0
-tsize = 0
+
+def nested_get(dic, keys):
+    for key in keys:
+        dic = dic[key]
+    return dic
 
 
-def load_file(tfile):
-    with open(tfile, 'rb') as f:
-        return bencode.bdecode(f.read())
+def nested_set(dic, keys, value):
+    for key in keys[:-1]:
+        dic = dic.setdefault(key, {})
+    dic[keys[-1]] = value
 
 
-def torrent_check(tdata, base):
-    if not tdata.get(b'info'):
-        raise RuntimeError('Invalid torrent data.')
-
-    chkpath = base
-    path = chk_basedir(chkpath, tdata)
-    tdata[b'rtorrent'] = {}
-    tdata[b'rtorrent'][b'directory'] = path.encode()
-
-
-def chk_basedir(path, tdata):
-    base_path = os.path.join(path, tdata[b'info'][b'name'].decode())
-    if not os.path.exists(base_path):
-        raise RuntimeError('Base path was not found.')
-
-    if is_multi(tdata):
-        if len(os.listdir(base_path)) == 0:
-            raise RuntimeError("Base path for torrent is empty. Can't resume a torrent that hasn't started yet!")
-        path = os.path.join(path, tdata[b'info'][b'name'].decode())
-
-    return path
-
-
-def is_multi(tdata):
-    """Returns True if torrent has multiple files, False if otherwise"""
-    try:
-        _ = tdata[b'info'][b'files']
-        return True
-    except KeyError:
-        return False
-
-
-def chunks(length, bsize):
+def calc_chunks(length, bsize):
     div = int(length / bsize)
     return div + 1 if length % bsize else div
 
 
-def getfiles(tdata):
-    global chunk_size, tsize, num_chunks
-    try:
-        chunk_size = tdata[b'info'][b'piece length']
-    except KeyError:
-        raise RuntimeError('Invalid torrent: No piece length key found.')
+class RFR:
+    CHUNK_HASH_SIZE = 20
 
-    files = []
-    tsize = 0
-    if is_multi(tdata):
-        for f in tdata[b'info'][b'files']:
-            files.append(f[b'path'][0].decode())
-            tsize += f[b'length']
-    else:
-        files = [tdata[b'info'][b'name'].decode()]
-        tsize = tdata[b'info'][b'length']
+    def __init__(self, tor_file, current_dl_loc, new_dl_loc=None):
+        """
+        Initializes the object.
+        :param str tor_file: Path to source torrent file that you want fast-resumed.
+        :param str current_dl_loc: Path where the torrent was downloaded to.
+        """
+        self.tor_file = tor_file
+        self.current_dl_loc = current_dl_loc
+        self.new_dl_loc = new_dl_loc
 
-    num_chunks = chunks(tsize, chunk_size)
-    if num_chunks * CHUNK_HASH_SIZE != len(tdata[b'info'][b'pieces']):
-        raise RuntimeError('Inconsistent chunks hash information!')
-    return files
+        self.num_chunks = 0
+        self.chunk_size = 0
+        self.chunk_size = 0
+        self.total_tor_size = 0
+        self.tor_data = None
+
+        self._load_file()
+
+    def _load_file(self):
+        """Loads torrent file data into a dict."""
+        if not os.path.exists(self.tor_file):
+            raise RuntimeError('Torrent file was not found. Please pass the path to a valid torrent file.')
+
+        with open(self.tor_file, 'rb') as f:
+            self.tor_data = bencode.bdecode(f.read())
+            if not self.get_tor_data_val('info'):
+                raise RuntimeError('Invalid torrent data.')
+
+    def get_tor_data_val(self, *keys):
+        """
+        Returns value from torrent data located at *keys. You can pass as many keys as you want.
+        Here's an example of what this does:
+
+            # Normally, without using get_tor_data_val, one might do:
+            RFR.tor_data['key1']['key2']
+            # With get_tor_data_val, simply use:
+            get_tor_data_val('key1', 'key2')
+
+        :param str keys: The keys that lead to the value you want to access. Keys are encoded automatically,
+        so pass these as strings.
+        :return: The value retrieved from self.tor_data using the keys provided.
+        """
+        encoded_keys = [k.encode() for k in keys]
+        return nested_get(self.tor_data, encoded_keys)
+
+    def set_tor_data_val(self, *keys, value):
+        """
+        Identical to get_tor_data_val, but with an additional parameter to set a torrent data value.
+        :param value: Value to set tor_data value to. Note that value must be a keyword arg.
+        :param str keys: The keys that lead to the value you want to access. Keys are encoded automatically,
+        so pass these as strings.
+        :return: The value retrieved from self.tor_data using the keys provided.
+        """
+        encoded_keys = [k.encode() for k in keys]
+        nested_set(self.tor_data, encoded_keys, value)
+
+    def tor_data_val_exists(self, *keys):
+        """Returns True if specified keys are in self.tor_data, False if otherwise."""
+        try:
+            _ = self.get_tor_data_val(*keys)
+            return True
+        except KeyError:
+            return False
+
+    def calc_file_chunks(self, offset, size):
+        return calc_chunks(offset + size, self.chunk_size) - calc_chunks(offset + 1, self.chunk_size) + 1
+
+    @property
+    def tor_is_multi_file(self):
+        """Is True if torrent has multiple files, False if otherwise."""
+        return self.tor_data_val_exists('info', 'files')
+
+    @property
+    def dl_files_path(self):
+        """The path where this torrent's files (should) have been downloaded."""
+        path = os.path.expandvars(self.current_dl_loc)
+        path = os.path.expanduser(path)
+        return os.path.join(path, self.get_tor_data_val('info', 'name').decode())
+
+    def check_download_locations(self):
+        """
+        Checks download location for files and makes sure that they're complete. Raises RuntimeError if files are
+        incomplete or not present. If download location exists, updates the torrent data with a
+        ['rtorrent']['directory'] entry.
+        :return: None
+        """
+        if not os.path.exists(self.dl_files_path):
+            raise RuntimeError(f'Torrent download was not found at download location {self.dl_files_path}.')
+
+        if self.tor_is_multi_file:
+            if len(os.listdir(self.dl_files_path)) == 0:
+                raise RuntimeError("Base path for torrent is empty. Can't resume a torrent that hasn't started yet!")
+
+        self.set_tor_data_val('rtorrent', 'directory', value=self.dl_files_path.encode())
+
+    def get_downloaded_files(self):
+        """
+        Returns list of files that should be in the download location. Also checks the download locations to
+        ensure that they exist. Will raise a RuntimeError if something is wrong with the download location or the
+        files.
+        :return: None
+        """
+        self.check_download_locations()
+        if not self.tor_data_val_exists('info', 'piece length'):
+            raise RuntimeError('Invalid torrent: No piece length key found.')
+
+        self.chunk_size = self.get_tor_data_val('info', 'piece length')
+        files = []
+        if self.tor_is_multi_file:
+            for file in self.get_tor_data_val('info', 'files'):
+                files.append(file[b'path'][0].decode())
+                self.total_tor_size += file[b'length']
+        else:
+            files = [self.get_tor_data_val('info', 'name').decode()]
+            self.total_tor_size = self.get_tor_data_val('info', 'length')
+
+        self.num_chunks = calc_chunks(self.total_tor_size, self.chunk_size)
+        if self.num_chunks * self.CHUNK_HASH_SIZE != len(self.get_tor_data_val('info', 'pieces')):
+            raise RuntimeError('Inconsistent chunks hash information!')
+        return files
+
+    def do_resume(self):
+        """
+        Creates and populates torrent's resume data. Will check all download locations and files to ensure they're
+        done before doing so.
+        :return: None
+        """
+        files = self.get_downloaded_files()
+        data_dir = self.dl_files_path if self.tor_is_multi_file else os.path.dirname(self.dl_files_path)
+
+        on_disk_size = 0  # on-disk data size counter
+        block_offset = 0  # block offset
+        missing = 0  # number of missing chunks
+
+        for idx, file in enumerate(files):
+            file_path = os.path.join(data_dir, file)
+            if not os.path.isfile(file_path):
+                raise RuntimeError("Something is wrong with the torrent's files. They either don't exist, or are not "
+                                   "normal files.")
+
+            file_size = os.path.getsize(file_path)
+            tor_len = self.get_tor_data_val('info', 'files')[idx][b'length'] if self.tor_is_multi_file else \
+                self.get_tor_data_val('info', 'length')
+
+            if tor_len != file_size:
+                raise RuntimeError("One of the torrent files does not match its expected size. Aborting.")
+
+            mtime = int(os.path.getmtime(file_path))
+            completed = self.calc_file_chunks(block_offset, file_size) if file_size else 0
+
+            # Add libtorrent resume data to torrent
+            self.set_tor_data_val('libtorrent_resume', 'files', value=[])
+            self.get_tor_data_val('libtorrent_resume', 'files').insert(idx, {
+                b'mtime': mtime,
+                b'completed': completed
+            })
+
+            on_disk_size += file_size
+            block_offset += tor_len
+
+        # Resume failed if on_disk_size = 0 (no files to resume) or on_disk_size doesn't match sum of all files in
+        # torrent
+        if on_disk_size != self.total_tor_size or on_disk_size == 0:
+            raise RuntimeError("File size verification failed. Files are missing.")
+
+        # Set vars in torrent
+        self.set_tor_data_val('rtorrent', 'chunks_wanted', value=missing)
+        self.set_tor_data_val('rtorrent', 'chunks_done', value=self.num_chunks - missing)
+        self.set_tor_data_val('rtorrent', 'complete', value=0 if missing else 1)
+        if not missing:
+            self.set_tor_data_val('libtorrent_resume', 'bitfield', value=self.num_chunks)
+
+    def save_to_file(self, dest=None):
+        """
+        Saves torrent data to file.
+        :param str dest: Path where file should be saved. If not provided, will output to current directory as
+        *torrent name*_fast.torrent
+        :return: None
+        """
+        encoded_tor_data = bencode.bencode(self.tor_data)
+        if dest is None:
+            no_ext = os.path.splitext(self.tor_file)[0]
+            filename = f'{os.path.basename(no_ext)}_fast.torrent'
+            dest = os.path.join(os.path.dirname(self.tor_file), filename)
+
+        with open(dest, 'wb') as f:
+            f.write(encoded_tor_data)
 
 
-def filechunks(offset, size):
-    return chunks(offset + size, chunk_size) - chunks(offset + 1, chunk_size) + 1
-
-
-def resume(tdata):
-    files = getfiles(tdata)
-    d = tdata[b'rtorrent'][b'directory'].decode()
-
-    ondisksize = 0  # on-disk data size counter
-    boffset = 0  # block offset
-    missing = 0  # chunks missing
-
-    for idx, f in enumerate(files):
-        full_path = os.path.join(d, f)
-        if not os.path.isfile(full_path):
-            raise RuntimeError("Something is wrong with the torrent's files. They either don't exist, or are not "
-                               "normal files.")
-
-        fstat = os.path.getsize(full_path)
-        trnt_length = tdata[b'info'][b'files'][idx][b'length'] if is_multi(tdata) else tdata[b'info'][b'length']
-
-        if trnt_length != fstat:
-            raise RuntimeError("One of the torrent files does not match its expected size. Aborting.")
-
-        mtime = int(os.path.getmtime(full_path))
-        completed = filechunks(boffset, fstat) if fstat else 0
-
-        # Add libtorrent resume data to torrent
-        tdata[b'libtorrent_resume'] = {}
-        tdata[b'libtorrent_resume'][b'files'] = []
-        tdata[b'libtorrent_resume'][b'files'].insert(idx, {
-            b'mtime': mtime,
-            b'completed': completed
-        })
-
-        ondisksize += fstat
-        boffset += trnt_length
-
-    # Resume failed if ondisksize = 0 (no files to resume) or ondisksize doesn't match sum of all files in torrent
-    if ondisksize != tsize or ondisksize == 0:
-        raise RuntimeError("File size verification failed. Files are missing.")
-
-    print('Resume summary for torrent %s: %d missing.' % (tdata[b'info'][b'name'], missing))
-
-    # Set vars in torrent
-    tdata[b'rtorrent'][b'chunks_wanted'] = missing
-    tdata[b'rtorrent'][b'chunks_done'] = num_chunks - missing
-    tdata[b'rtorrent'][b'complete'] = 0 if missing else 1
-    if not missing:
-        tdata[b'libtorrent_resume'][b'bitfield'] = num_chunks
-
-
-def savetofile(tdata, dest):
-    encoded_tdata = bencode.bencode(tdata)
-    with open(dest, 'wb') as f:
-        f.write(encoded_tdata)
-
-
-def rfr(tfile, base, dest):
-    if not os.path.exists(tfile):
-        raise RuntimeError('Torrent file was not found. Please pass the path to a valid torrent file.')
-
-    # Process torrent
-    torrent = load_file(tfile)
-    torrent_check(torrent, base)
-    resume(torrent)
-
-    # Write torrent to file
-    savetofile(torrent, dest)
-    print('Done!')
+def rfr(tor_file, current_dl_loc, new_dl_loc=None, dest=None):
+    """
+    Wrapper for RFR class.
+    :param tor_file: Path to torrent file that you want to fast resume.
+    :param current_dl_loc: Path where the torrent was downloaded to.
+    :param new_dl_loc: New download location to set in the fast resume torrent.
+    :param dest: Path to write fast resume torrent to.
+    :return:
+    """
+    tor = RFR(tor_file, current_dl_loc, new_dl_loc)
+    tor.do_resume()
+    tor.save_to_file(dest)
 
 
 if __name__ == '__main__':
-    rfr('test-multi.torrent', '/Users/bradenbaird/Downloads', 'test-multi-fast.torrent')
+    test = RFR('tors/test.torrent', '~/Downloads')
+    test_multi = RFR('tors/test-multi.torrent', '~/Downloads')
+    test.do_resume()
+    test_multi.do_resume()
 
-    rfr('test.torrent', '/Users/bradenbaird/Downloads', 'test-fast.torrent')
+    rfr('tors/test.torrent', '~/Downloads', dest='tors/test_fast.torrent')
+    rfr('tors/test-multi.torrent', '~/Downloads', dest='tors/test-multi_fast.torrent')
