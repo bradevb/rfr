@@ -1,4 +1,8 @@
+import hashlib
 import os
+import time
+import warnings
+import xmlrpc.client
 
 import bencode
 
@@ -20,6 +24,15 @@ def calc_chunks(length, bsize):
     return div + 1 if length % bsize else div
 
 
+def calc_info_hash(info):
+    """
+    Calculates a torrent's info hash.
+    :param info: The 'info' section of a torrent. Use bencode on the torrent to get this.
+    :return str: The info hash of the torrent.
+    """
+    return hashlib.sha1(bencode.bencode(info)).hexdigest()
+
+
 class RFR:
     CHUNK_HASH_SIZE = 20
 
@@ -37,9 +50,14 @@ class RFR:
         self.chunk_size = 0
         self.chunk_size = 0
         self.total_tor_size = 0
+        self.has_saved_file = False
+        self.fr_file_loc = None  # Fast resume file location; the path of new torrent file when save_to_file is called
+        self.has_resumed = False
         self.tor_data = None
 
         self._load_file()
+
+        self.info_hash = calc_info_hash(self.get_tor_data_val('info'))
 
     def _load_file(self):
         """Loads torrent file data into a dict."""
@@ -102,6 +120,15 @@ class RFR:
         path = os.path.expanduser(path)
         return os.path.join(path, self.get_tor_data_val('info', 'name').decode())
 
+    @property
+    def dl_base_path(self):
+        """
+        The BASE path for this torrent's files. If it's a multi-file torrent,
+        this will be <download directory/torrent name>. If it's a single-file torrent,
+        it will be <download directory/file name>
+        """
+        return self.dl_files_path if self.tor_is_multi_file else os.path.dirname(self.dl_files_path)
+
     def check_download_locations(self):
         """
         Checks download location for files and makes sure that they're complete. Raises RuntimeError if files are
@@ -115,8 +142,6 @@ class RFR:
         if self.tor_is_multi_file:
             if len(os.listdir(self.dl_files_path)) == 0:
                 raise RuntimeError("Base path for torrent is empty. Can't resume a torrent that hasn't started yet!")
-
-        self.set_tor_data_val('rtorrent', 'directory', value=self.dl_files_path.encode())
 
     def get_downloaded_files(self):
         """
@@ -151,12 +176,12 @@ class RFR:
         :return: None
         """
         files = self.get_downloaded_files()
-        data_dir = self.dl_files_path if self.tor_is_multi_file else os.path.dirname(self.dl_files_path)
+        data_dir = self.dl_base_path
 
         on_disk_size = 0  # on-disk data size counter
         block_offset = 0  # block offset
-        missing = 0  # number of missing chunks
 
+        self.set_tor_data_val('libtorrent_resume', 'files', value=[])
         for idx, file in enumerate(files):
             file_path = os.path.join(data_dir, file)
             if not os.path.isfile(file_path):
@@ -174,8 +199,8 @@ class RFR:
             completed = self.calc_file_chunks(block_offset, file_size) if file_size else 0
 
             # Add libtorrent resume data to torrent
-            self.set_tor_data_val('libtorrent_resume', 'files', value=[])
             self.get_tor_data_val('libtorrent_resume', 'files').insert(idx, {
+                b'priority': 0,
                 b'mtime': mtime,
                 b'completed': completed
             })
@@ -189,11 +214,27 @@ class RFR:
             raise RuntimeError("File size verification failed. Files are missing.")
 
         # Set vars in torrent
-        self.set_tor_data_val('rtorrent', 'chunks_wanted', value=missing)
-        self.set_tor_data_val('rtorrent', 'chunks_done', value=self.num_chunks - missing)
-        self.set_tor_data_val('rtorrent', 'complete', value=0 if missing else 1)
-        if not missing:
-            self.set_tor_data_val('libtorrent_resume', 'bitfield', value=self.num_chunks)
+        rtorrent_vals = {
+            b'state': 1,  # started
+            b'state_changed': int(time.time()),
+            b'state_counter': 1,
+            b'chunks_wanted': 0,
+            b'chunks_done': self.num_chunks,
+            b'complete': 1,
+            b'hashing': 0,
+            b'directory': self.new_dl_loc.encode() or self.dl_base_path.encode(),
+            b'timestamp.finished': 0,
+            b'timestamp.started': int(time.time()),
+        }
+        libtorrent_resume_vals = {
+            b'bitfield': self.num_chunks,
+            b'uncertain_pieces.timestamp': int(time.time())
+        }
+
+        self.set_tor_data_val('rtorrent', value=rtorrent_vals)
+        self.get_tor_data_val('libtorrent_resume').update(libtorrent_resume_vals)
+
+        self.has_resumed = True
 
     def save_to_file(self, dest=None):
         """
@@ -211,6 +252,28 @@ class RFR:
         with open(dest, 'wb') as f:
             f.write(encoded_tor_data)
 
+        self.has_saved_file = True
+        self.fr_file_loc = dest
+
+    def add_to_rtorrent(self, server_url, custom_ratio=None):
+        """
+        Add fast resume torrent to rtorrent via xml rpc.
+        :param str server_url: URL of the xml rpc server.
+        :param float custom_ratio: Ratio to set in torrent's custom_ratio field.
+        :return: None
+        """
+        if not self.has_resumed:
+            warnings.warn('add_to_rtorrent was called before calling do_resume. Doing this will add the torrent to '
+                          'rtorrent without fast resuming it.')
+
+        encoded_tor_data = bencode.bencode(self.tor_data)
+
+        server = xmlrpc.client.Server(server_url)
+        server.load.raw_start('', xmlrpc.client.Binary(encoded_tor_data),
+                              f'd.directory.set="{self.new_dl_loc or self.dl_base_path}"', 'd.priority.set=2')
+        if custom_ratio is not None:
+            server.d.custom.set(self.info_hash, 'custom_ratio', str(float(custom_ratio)))
+
 
 def rfr(tor_file, current_dl_loc, new_dl_loc=None, dest=None):
     """
@@ -224,13 +287,3 @@ def rfr(tor_file, current_dl_loc, new_dl_loc=None, dest=None):
     tor = RFR(tor_file, current_dl_loc, new_dl_loc)
     tor.do_resume()
     tor.save_to_file(dest)
-
-
-if __name__ == '__main__':
-    test = RFR('tors/test.torrent', '~/Downloads')
-    test_multi = RFR('tors/test-multi.torrent', '~/Downloads')
-    test.do_resume()
-    test_multi.do_resume()
-
-    rfr('tors/test.torrent', '~/Downloads', dest='tors/test_fast.torrent')
-    rfr('tors/test-multi.torrent', '~/Downloads', dest='tors/test-multi_fast.torrent')
