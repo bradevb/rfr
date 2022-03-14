@@ -4,7 +4,10 @@ import time
 import warnings
 import xmlrpc.client
 
-import bencode
+import bencodepy
+
+__author__ = 'Braden Baird <bradenbdev@gmail.com>'
+__version__ = '0.1.1'
 
 
 def nested_get(dic, keys):
@@ -30,10 +33,10 @@ def calc_info_hash(info):
     :param info: The 'info' section of a torrent. Use bencode on the torrent to get this.
     :return str: The info hash of the torrent.
     """
-    return hashlib.sha1(bencode.bencode(info)).hexdigest()
+    return hashlib.sha1(bencodepy.bencode(info)).hexdigest()
 
 
-class RFR:
+class FastTorrent:
     CHUNK_HASH_SIZE = 20
 
     def __init__(self, tor_file, current_dl_loc, new_dl_loc=None):
@@ -65,7 +68,7 @@ class RFR:
             raise RuntimeError('Torrent file was not found. Please pass the path to a valid torrent file.')
 
         with open(self.tor_file, 'rb') as f:
-            self.tor_data = bencode.bdecode(f.read())
+            self.tor_data = bencodepy.bdecode(f.read())
             if not self.get_tor_data_val('info'):
                 raise RuntimeError('Invalid torrent data.')
 
@@ -75,7 +78,7 @@ class RFR:
         Here's an example of what this does:
 
             # Normally, without using get_tor_data_val, one might do:
-            RFR.tor_data['key1']['key2']
+            FastTorrent.tor_data['key1']['key2']
             # With get_tor_data_val, simply use:
             get_tor_data_val('key1', 'key2')
 
@@ -222,7 +225,7 @@ class RFR:
             b'chunks_done': self.num_chunks,
             b'complete': 1,
             b'hashing': 0,
-            b'directory': self.new_dl_loc.encode() or self.dl_base_path.encode(),
+            b'directory': self.new_dl_loc.encode() if self.new_dl_loc else self.dl_base_path.encode(),
             b'timestamp.finished': 0,
             b'timestamp.started': int(time.time()),
         }
@@ -243,7 +246,7 @@ class RFR:
         *torrent name*_fast.torrent
         :return: None
         """
-        encoded_tor_data = bencode.bencode(self.tor_data)
+        encoded_tor_data = bencodepy.bencode(self.tor_data)
         if dest is None:
             no_ext = os.path.splitext(self.tor_file)[0]
             filename = f'{os.path.basename(no_ext)}_fast.torrent'
@@ -266,7 +269,7 @@ class RFR:
             warnings.warn('add_to_rtorrent was called before calling do_resume. Doing this will add the torrent to '
                           'rtorrent without fast resuming it.')
 
-        encoded_tor_data = bencode.bencode(self.tor_data)
+        encoded_tor_data = bencodepy.bencode(self.tor_data)
 
         server = xmlrpc.client.Server(server_url)
         server.load.raw_start('', xmlrpc.client.Binary(encoded_tor_data),
@@ -277,13 +280,13 @@ class RFR:
 
 def rfr(tor_file, current_dl_loc, new_dl_loc=None, dest=None):
     """
-    Wrapper for RFR class.
+    Wrapper for FastTorrent class.
     :param tor_file: Path to torrent file that you want to fast resume.
     :param current_dl_loc: Path where the torrent was downloaded to.
     :param new_dl_loc: New download location to set in the fast resume torrent.
     :param dest: Path to write fast resume torrent to.
     :return:
     """
-    tor = RFR(tor_file, current_dl_loc, new_dl_loc)
+    tor = FastTorrent(tor_file, current_dl_loc, new_dl_loc)
     tor.do_resume()
     tor.save_to_file(dest)
