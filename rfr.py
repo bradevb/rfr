@@ -161,7 +161,8 @@ class FastTorrent:
         files = []
         if self.tor_is_multi_file:
             for file in self.get_tor_data_val('info', 'files'):
-                files.append(file[b'path'][0].decode())
+                file_path = os.path.join(*file[b'path']).decode()
+                files.append(file_path)
                 self.total_tor_size += file[b'length']
         else:
             files = [self.get_tor_data_val('info', 'name').decode()]
