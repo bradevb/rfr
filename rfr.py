@@ -7,7 +7,7 @@ import xmlrpc.client
 import bencodepy
 
 __author__ = 'Braden Baird <bradenbdev@gmail.com>'
-__version__ = '0.1.2'
+__version__ = '0.1.3'
 
 
 def nested_get(dic, keys):
