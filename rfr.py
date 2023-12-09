@@ -1,3 +1,6 @@
+#! /usr/bin/env python3
+
+import argparse
 import hashlib
 import os
 import time
@@ -291,3 +294,19 @@ def rfr(tor_file, current_dl_loc, new_dl_loc=None, dest=None):
     tor = FastTorrent(tor_file, current_dl_loc, new_dl_loc)
     tor.do_resume()
     tor.save_to_file(dest)
+
+
+def main():
+    parser = argparse.ArgumentParser(description='rtorrent fast resume')
+    parser.add_argument('tor_file', help='Path to the torrent file')
+    parser.add_argument('current_dl_loc', help='Path where the torrent was downloaded to')
+    parser.add_argument('-n', '--new-loc', default=None,
+                        help='New download location')
+    parser.add_argument('-d', '--dest', default=None,
+                        help='Path to write torrent file to')
+    args = parser.parse_args()
+    rfr(args.tor_file, args.current_dl_loc, args.new_loc, args.dest)
+
+
+if __name__ == '__main__':
+    main()
