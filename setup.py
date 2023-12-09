@@ -27,5 +27,5 @@ setup(
     long_description_content_type='text/markdown',
     license="GPLv3",
     classifiers=rfr_classifiers,
-    python_requires=">=3.4.0",
+    python_requires=">=3.6",
 )
