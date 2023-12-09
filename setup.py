@@ -30,4 +30,9 @@ setup(
     license="GPLv3",
     classifiers=rfr_classifiers,
     python_requires=">=3.4.0",
+    entry_points={
+        'console_scripts': [
+            'rfr = rfr:main'
+        ]
+    },
 )
